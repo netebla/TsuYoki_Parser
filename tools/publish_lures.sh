@@ -9,8 +9,8 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Staging TsuYoki Lures 2014-2025 (this can take a long time if iCloud is evicting files)..."
-git add "TsuYoki Lures 2014-2025"
+echo "Staging TsuYoki Lures 2014-2026 (this can take a long time if iCloud is evicting files)..."
+git add "TsuYoki Lures 2014-2026"
 
 echo "Done staging. Next:"
 echo "  git commit -m \"Add lure images\""

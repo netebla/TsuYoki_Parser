@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 Парсер для сайта tsuyoki.ru.
-Обрабатывает список артикулов (из XML или Excel), ищет изображения в GitHub-репозитории
-(ветка `main`, каталог `TsuYoki Lures 2014-2025`), при отсутствии — скачивает с tsuyoki.ru.
+Обрабатывает список артикулов (из XML или Excel). Изображения: при `--local-lures` — сначала
+локальная папка моделей, иначе только GitHub (ветка `main`, каталог `TsuYoki Lures 2014-2026`),
+при отсутствии — tsuyoki.ru.
 Выравнивание: квадрат, воблер по центру и горизонтально (align_image + fallback PIL).
 """
 
 from __future__ import annotations
 
 import logging
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
 import math
 import os
 import random
@@ -23,18 +28,34 @@ from pathlib import Path, PurePosixPath
 from typing import Optional
 from urllib.parse import quote, urljoin, urlparse
 
+logger.info("Подключаю requests / urllib3 (на медленном диске может занять 1–3+ мин)…")
 import requests
 from bs4 import BeautifulSoup
 
+logger.info("Подключаю OpenCV и NumPy (холодный старт часто 1–3 мин)…")
 try:
     import cv2
     import numpy as np
     _ALIGN_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as e:
     cv2 = None
     np = None
     _ALIGN_AVAILABLE = False
+    msg = str(e)
+    if "mmap" in msg or "dlopen" in msg or "cv2.abi3" in msg:
+        logger.warning(
+            "OpenCV не загрузился (mmap/dlopen). Частая причина — venv или проект в iCloud Drive "
+            "с «оптимизацией хранилища»: бинарник .so не полностью локальный. "
+            "Сделайте: перенос проекта на локальный каталог (например ~/Projects/…), "
+            "или «Загрузить сейчас» для папки venv, затем "
+            "`pip install --force-reinstall --no-cache-dir opencv-python-headless numpy`. "
+            "Ошибка: %s",
+            msg,
+        )
+    else:
+        logger.warning("OpenCV/NumPy не загрузились, выравнивание отключено: %s", msg)
 
+logger.info("Подключаю Pillow…")
 try:
     from PIL import Image
     _PIL_AVAILABLE = True
@@ -42,18 +63,46 @@ except ImportError:
     Image = None
     _PIL_AVAILABLE = False
 
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger(__name__)
+logger.info("Импорт завершён.")
+
+
+def configure_runtime_logging(*, log_file: Optional[Path] = None, verbose: bool = False) -> None:
+    """Доп. настройка логов: файл и/или DEBUG (вызывать из main() после parse_args)."""
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    use_ts = bool(log_file) or verbose
+    fmt = (
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        if use_ts
+        else logging.Formatter("%(message)s")
+    )
+    for h in root.handlers:
+        h.setFormatter(fmt)
+        h.setLevel(logging.DEBUG if verbose else logging.INFO)
+    if log_file:
+        p = Path(log_file).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p = p.resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(p, encoding="utf-8")
+        fh.setFormatter(fmt)
+        fh.setLevel(logging.DEBUG if verbose else logging.INFO)
+        root.addHandler(fh)
+        logger.info("Лог также пишется в файл: %s", p)
+    if verbose:
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
 # Поиск изображений (по модели и коду цвета из наименования)
 # ---------------------------------------------------------------------------
 
-DEFAULT_LURES_ROOT = Path(__file__).resolve().parent / "TsuYoki Lures 2014-2025"
+DEFAULT_LURES_ROOT = Path(__file__).resolve().parent / "TsuYoki Lures 2014-2026"
 DEFAULT_GITHUB_REPO = "netebla/TsuYoki_Parser"
 DEFAULT_GITHUB_BRANCH = "main"
-DEFAULT_GITHUB_LURES_DIR = "TsuYoki Lures 2014-2025"
+DEFAULT_GITHUB_LURES_DIR = "TsuYoki Lures 2014-2026"
 
 
 def _normalize_model_for_folder(folder_name: str) -> str:
@@ -64,6 +113,31 @@ def _normalize_model_for_folder(folder_name: str) -> str:
     s = re.sub(r"\s+2025\s*$", "", s)
     s = re.sub(r"\s*\(НОВАЯ МОДЕЛЬ\)\s*$", "", s, flags=re.I)
     return s.strip().upper()
+
+
+# Папки вроде «MACHO SR42F» vs наименование «MACHO SR 42F …»
+_SR_MR_DIGIT_RE = re.compile(r"\b(SR|MR)\s+(\d)", re.I)
+
+
+def _lure_model_index_key(name: str) -> str:
+    """Ключ индекса: SR/MR + пробел + цифра → без пробела (SR42F и SR 42F в одном бакете)."""
+    norm = _normalize_model_for_folder(name)
+    if not norm:
+        return ""
+    return _SR_MR_DIGIT_RE.sub(r"\1\2", norm).upper()
+
+
+def _lure_model_lookup_keys(name_or_model: str) -> list[str]:
+    """Ключи для поиска: канонический, как в названии, и полное схлопывание пробелов."""
+    norm = _normalize_model_for_folder(name_or_model)
+    if not norm:
+        return []
+    primary = _SR_MR_DIGIT_RE.sub(r"\1\2", norm).upper()
+    keys: list[str] = []
+    for k in (primary, norm, re.sub(r"\s+", "", norm)):
+        if k and k not in keys:
+            keys.append(k)
+    return keys
 
 
 def _extract_color_code_from_filename(filename: str) -> Optional[str]:
@@ -160,12 +234,14 @@ def build_index(lures_root: Optional[Path] = None) -> dict:
     root = lures_root or DEFAULT_LURES_ROOT
     if not root.is_dir():
         return {}
+    t0 = time.perf_counter()
+    logger.info("Сканирование локальной папки приманок: %s …", root)
     index = {}
     for folder in root.iterdir():
         if not folder.is_dir():
             continue
-        base_model = _normalize_model_for_folder(folder.name)
-        if not base_model:
+        bucket = _lure_model_index_key(folder.name)
+        if not bucket:
             continue
         files_with_codes = []
         for f in folder.iterdir():
@@ -173,9 +249,15 @@ def build_index(lures_root: Optional[Path] = None) -> dict:
                 continue
             code = _extract_color_code_from_filename(f.name)
             files_with_codes.append((f.name, code))
-        if base_model not in index:
-            index[base_model] = []
-        index[base_model].append((str(folder), files_with_codes))
+        index.setdefault(bucket, []).append((str(folder), files_with_codes))
+    n_models = len(index)
+    n_files = sum(len(fc) for groups in index.values() for _, fc in groups)
+    logger.info(
+        "Локальный индекс готов: моделей %s, файлов изображений %s, за %.1f с",
+        n_models,
+        n_files,
+        time.perf_counter() - t0,
+    )
     return index
 
 
@@ -194,14 +276,8 @@ def find_local_image(
     if not model_norm or not color_norm:
         return None
 
-    def folder_keys_to_try(m: str):
-        yield m
-        collapsed = re.sub(r"\s+", "", m)
-        if collapsed != m:
-            yield collapsed
-
     folders = []
-    for key in folder_keys_to_try(model_norm):
+    for key in _lure_model_lookup_keys(model):
         folders = index.get(key, [])
         if folders:
             break
@@ -244,6 +320,8 @@ def build_remote_index(
     owner_repo = repo
     tree_url = f"https://api.github.com/repos/{owner_repo}/git/trees/{quote(branch, safe='')}?recursive=1"
     req_session = session or requests.Session()
+    t0 = time.perf_counter()
+    logger.debug("GitHub tree API: %s", tree_url)
     response = req_session.get(tree_url, timeout=timeout)
     response.raise_for_status()
     payload = response.json()
@@ -273,10 +351,17 @@ def build_remote_index(
         by_folder.setdefault(folder_name, []).append((filename, color_code, raw_url))
 
     for folder_name, files in by_folder.items():
-        base_model = _normalize_model_for_folder(folder_name)
-        if not base_model:
+        bucket = _lure_model_index_key(folder_name)
+        if not bucket:
             continue
-        index.setdefault(base_model, []).append((folder_name, files))
+        index.setdefault(bucket, []).append((folder_name, files))
+    n_img = sum(len(files) for groups in index.values() for _, files in groups)
+    logger.info(
+        "Индекс GitHub: ключей моделей %s, файлов изображений %s, за %.1f с",
+        len(index),
+        n_img,
+        time.perf_counter() - t0,
+    )
     return index
 
 
@@ -293,14 +378,8 @@ def find_remote_image(
     if not model_norm or not color_norm:
         return None
 
-    def folder_keys_to_try(m: str):
-        yield m
-        collapsed = re.sub(r"\s+", "", m)
-        if collapsed != m:
-            yield collapsed
-
     folders = []
-    for key in folder_keys_to_try(model_norm):
+    for key in _lure_model_lookup_keys(model):
         folders = index.get(key, [])
         if folders:
             break
@@ -616,6 +695,8 @@ class TsuYokiParser:
         github_repo: str = DEFAULT_GITHUB_REPO,
         github_branch: str = DEFAULT_GITHUB_BRANCH,
         github_lures_dir: str = DEFAULT_GITHUB_LURES_DIR,
+        use_local_lures: bool = False,
+        lures_root: Optional[Path] = None,
     ):
         self.input_file = input_file
         self.output_dir_ready = Path(output_dir_ready)
@@ -629,11 +710,13 @@ class TsuYokiParser:
         })
         self.failed_items = []
         self.max_retries = 3
-        self.lures_root = Path(__file__).resolve().parent / "TsuYoki Lures 2014-2025"
+        self.use_local_lures = use_local_lures
+        self.lures_root = (Path(lures_root) if lures_root is not None else DEFAULT_LURES_ROOT).resolve()
         self.github_repo = github_repo
         self.github_branch = github_branch
         self.github_lures_dir = github_lures_dir
         self._remote_index = None
+        self._local_index = None
         self._create_output_dir()
 
     def _mark_failed(self, article: str, reason: str, source_file: Optional[str] = None):
@@ -923,6 +1006,33 @@ class TsuYokiParser:
         logger.info(f"Обработка артикула: {article}" + (f" ({name[:50]}...)" if name and len(name) > 50 else (f" ({name})" if name else "")) + (f" -> {basename}.jpg" if output_basename else ""))
 
         if name and name.strip():
+            nm = name.strip()
+            if self.use_local_lures:
+                if self._local_index is None:
+                    self._local_index = build_index(self.lures_root)
+                local_path = find_local_image_from_name(nm, lures_root=self.lures_root, index=self._local_index)
+                if local_path and local_path.is_file():
+                    dest = self.output_dir_ready / f"{basename}.jpg"
+                    try:
+                        self._save_raw_local(local_path, basename)
+                        if align_lure_image(local_path, dest):
+                            logger.info(f"Изображение из локальной папки выровнено и сохранено: {local_path.name} -> {dest}")
+                            return True
+                        diagnose_msg = "Локальный файл найден, но выравнивание не удалось"
+                        if _cv_read_image(local_path) is None:
+                            diagnose_msg = (
+                                "Локальный файл не читается (cv2/PIL). "
+                                "Проверьте путь/кодировку имени файла и целостность файла"
+                            )
+                        logger.warning(f"{diagnose_msg}: {local_path}")
+                        self._mark_failed(article, diagnose_msg, str(local_path))
+                        return False
+                    except Exception as e:
+                        logger.warning(f"Не удалось обработать локальный файл: {e}")
+                        self._mark_failed(article, f"Ошибка обработки локального файла: {e}", local_path.name)
+                        return False
+                logger.debug("В локальной папке не найдено изображение по наименованию, пробуем GitHub")
+
             if self._remote_index is None:
                 try:
                     self._remote_index = build_remote_index(
@@ -936,7 +1046,7 @@ class TsuYokiParser:
                     logger.warning(f"Не удалось собрать индекс изображений из GitHub: {e}")
                     self._remote_index = {}
 
-            remote_match = find_remote_image_from_name(name.strip(), index=self._remote_index)
+            remote_match = find_remote_image_from_name(nm, index=self._remote_index)
             if remote_match:
                 filename, remote_url = remote_match
                 dest = self.output_dir_ready / f"{basename}.jpg"
@@ -1141,8 +1251,20 @@ def main():
     parser.add_argument('--github-branch', default=DEFAULT_GITHUB_BRANCH,
                         help='Ветка GitHub для поиска изображений (по умолчанию: main)')
     parser.add_argument('--github-lures-dir', default=DEFAULT_GITHUB_LURES_DIR,
-                        help='Путь к каталогу моделей в репозитории (по умолчанию: TsuYoki Lures 2014-2025)')
+                        help='Путь к каталогу моделей в репозитории (по умолчанию: TsuYoki Lures 2014-2026)')
+    parser.add_argument('--local-lures', action='store_true',
+                        help='Сначала искать изображения в локальной папке (см. --lures-root), затем GitHub, затем сайт')
+    parser.add_argument('--lures-root', default=None, metavar='ПУТЬ',
+                        help='Корень каталога с подпапками моделей для --local-lures (по умолчанию: TsuYoki Lures 2014-2026 рядом с main.py)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Подробный лог (DEBUG) в консоль')
+    parser.add_argument('--log-file', default=None, metavar='ФАЙЛ',
+                        help='Дублировать лог в файл UTF-8 (создаёт каталоги при необходимости)')
     args = parser.parse_args()
+    configure_runtime_logging(
+        log_file=Path(args.log_file).expanduser() if args.log_file else None,
+        verbose=args.verbose,
+    )
     parser_instance = TsuYokiParser(
         input_file=args.input,
         output_dir_ready=args.output_ready,
@@ -1151,6 +1273,8 @@ def main():
         github_repo=args.github_repo,
         github_branch=args.github_branch,
         github_lures_dir=args.github_lures_dir,
+        use_local_lures=args.local_lures,
+        lures_root=Path(args.lures_root) if args.lures_root else None,
     )
     xml_source = args.xml if args.xml is not None else 'https://gria.ru/bitrix/catalog_export/imageless_offers.xml'
     if args.excel:
